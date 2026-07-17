@@ -204,6 +204,22 @@ fn create_float_bench_batch_with_nans(size: usize, nan_density: f32) -> Result<R
     )?)
 }
 
+fn create_decimal_bench_batch(size: usize, null_density: f32) -> Result<RecordBatch> {
+    let fields = vec![
+        Field::new("_1", Decimal32Type::DEFAULT_TYPE, false),
+        Field::new("_2", Decimal64Type::DEFAULT_TYPE, false),
+        Field::new("_3", Decimal128Type::DEFAULT_TYPE, false),
+        Field::new("_4", Decimal256Type::DEFAULT_TYPE, false),
+    ];
+    let schema = Schema::new(fields);
+    Ok(create_random_batch(
+        Arc::new(schema),
+        size,
+        null_density,
+        0.75,
+    )?)
+}
+
 fn create_list_primitive_bench_batch(
     size: usize,
     null_density: f32,
@@ -276,6 +292,17 @@ fn create_struct_bench_batch(size: usize, null_density: f32) -> Result<RecordBat
         ])),
         true,
     )];
+    let schema = Schema::new(fields);
+    Ok(create_random_batch(
+        Arc::new(schema),
+        size,
+        null_density,
+        0.75,
+    )?)
+}
+
+fn create_fsb_bench_batch(size: usize, null_density: f32, len: i32) -> Result<RecordBatch> {
+    let fields = vec![Field::new("_1", DataType::FixedSizeBinary(len), true)];
     let schema = Schema::new(fields);
     Ok(create_random_batch(
         Arc::new(schema),
@@ -404,6 +431,9 @@ fn create_batches() -> Vec<(&'static str, RecordBatch)> {
     let batch = create_float_bench_batch_with_nans(BATCH_SIZE, 0.5).unwrap();
     batches.push(("float_with_nans", batch));
 
+    let batch = create_decimal_bench_batch(BATCH_SIZE, 0.75).unwrap();
+    batches.push(("decimal", batch));
+
     let batch = create_list_primitive_bench_batch(BATCH_SIZE, 0.25, 0.75).unwrap();
     batches.push(("list_primitive", batch));
 
@@ -427,6 +457,9 @@ fn create_batches() -> Vec<(&'static str, RecordBatch)> {
 
     let batch = create_struct_bench_batch(BATCH_SIZE, 1.0).unwrap();
     batches.push(("struct_all_null", batch));
+
+    let batch = create_fsb_bench_batch(BATCH_SIZE, 0.9, 16).unwrap();
+    batches.push(("fsb", batch));
 
     batches
 }
