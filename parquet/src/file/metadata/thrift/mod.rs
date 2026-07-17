@@ -917,40 +917,27 @@ impl OrdinalAssigner {
 
     /// Sets [`RowGroupMetaData::ordinal`] if it is missing.
     ///
-    /// # Arguments
-    /// - actual_ordinal: The ordinal (index) of the row group being processed
-    ///   in the file metadata.
-    /// - rg: The [`RowGroupMetaData`] to potentially modify.
+    /// The ordinal of a row-group is definitionally its position within the
+    /// file (`actual_ordinal`). When a writer omits the field on some row-groups
+    /// but populates it on others (a pattern seen with several Go parquet
+    /// writers), the parquet spec still permits the file. Assign the natural
+    /// sequential ordinal to any row-group missing one and keep every other
+    /// row-group's writer-supplied value untouched.
     ///
-    /// Ensures:
-    /// 1. If the first row group has an ordinal, all subsequent row groups must
-    ///    also have ordinals.
-    /// 2. If the first row group does NOT have an ordinal, all subsequent row
-    ///    groups must also not have ordinals.
+    /// `first_has_ordinal` is preserved on the struct so callers can still
+    /// inspect what the writer initially emitted for the file, but it no
+    /// longer gates whether the parser accepts subsequent row-groups.
     fn ensure(
         &mut self,
         actual_ordinal: i16,
         mut rg: RowGroupMetaData,
     ) -> Result<RowGroupMetaData> {
         let rg_has_ordinal = rg.ordinal.is_some();
-
-        // Only set first_has_ordinal if it's None (first row group that arrives)
         if self.first_has_ordinal.is_none() {
             self.first_has_ordinal = Some(rg_has_ordinal);
         }
-
-        // assign ordinal if missing and consistent with first row group
-        let first_has_ordinal = self.first_has_ordinal.unwrap();
-        if !first_has_ordinal && !rg_has_ordinal {
+        if rg.ordinal.is_none() {
             rg.ordinal = Some(actual_ordinal);
-        } else if first_has_ordinal != rg_has_ordinal {
-            return Err(general_err!(
-                "Inconsistent ordinal assignment: first_has_ordinal is set to \
-                {} but row-group with actual ordinal {} has rg_has_ordinal set to {}",
-                first_has_ordinal,
-                actual_ordinal,
-                rg_has_ordinal
-            ));
         }
         Ok(rg)
     }
@@ -1952,5 +1939,99 @@ pub(crate) mod tests {
         let err = DataPageHeaderV2::read_thrift_without_stats(&mut prot)
             .expect_err("malformed bool field should return an error");
         assert_malformed_bool_error(err);
+    }
+
+    fn empty_schema_descr() -> Arc<SchemaDescriptor> {
+        let schema = crate::schema::types::Type::group_type_builder("test_schema")
+            .build()
+            .unwrap();
+        Arc::new(SchemaDescriptor::new(Arc::new(schema)))
+    }
+
+    fn row_group_with_ordinal(schema_descr: Arc<SchemaDescriptor>, ordinal: Option<i16>) -> RowGroupMetaData {
+        let mut builder = RowGroupMetaData::builder(schema_descr);
+        if let Some(value) = ordinal {
+            builder = builder.set_ordinal(value);
+        }
+        builder.build().unwrap()
+    }
+
+    #[test]
+    fn ordinal_assigner_fills_missing_first_row_group_ordinal() {
+        let schema = empty_schema_descr();
+        let mut assigner = super::OrdinalAssigner::new();
+
+        // First row-group emitted without an ordinal — the writer omitted it but
+        // the file position (0) is authoritative, so the assigner fills it in.
+        let rg0 =
+            assigner
+                .ensure(0, row_group_with_ordinal(schema.clone(), None))
+                .expect("no ordinal on the first row-group should not fail");
+        assert_eq!(rg0.ordinal(), Some(0));
+    }
+
+    #[test]
+    fn ordinal_assigner_tolerates_first_missing_then_present() {
+        // Regression for the strict `Inconsistent ordinal assignment` error that
+        // `apache/arrow-rs` commit `3d5428da` introduced in parquet-57.1.0. Some
+        // Go parquet writers omit `RowGroup.ordinal` on the first row-group and
+        // populate it on later row-groups, producing files that parquet-rs used
+        // to reject outright. The atlas fork softens the check: assign a
+        // sequential ordinal to any row-group missing one, keep every other
+        // writer-supplied value, and never surface an error for the mismatch.
+        let schema = empty_schema_descr();
+        let mut assigner = super::OrdinalAssigner::new();
+
+        let rg0 =
+            assigner
+                .ensure(0, row_group_with_ordinal(schema.clone(), None))
+                .expect("first row-group without ordinal must be accepted");
+        let rg1 =
+            assigner
+                .ensure(1, row_group_with_ordinal(schema.clone(), Some(1)))
+                .expect("later row-group with ordinal must be accepted after a missing first");
+        let rg2 =
+            assigner
+                .ensure(2, row_group_with_ordinal(schema, Some(2)))
+                .expect("subsequent row-groups with ordinal remain accepted");
+
+        assert_eq!(rg0.ordinal(), Some(0));
+        assert_eq!(rg1.ordinal(), Some(1));
+        assert_eq!(rg2.ordinal(), Some(2));
+    }
+
+    #[test]
+    fn ordinal_assigner_tolerates_first_present_then_missing() {
+        // Symmetric case: writer sets ordinal on the first row-group and then
+        // omits it on a later row-group. The upstream strict check errored on
+        // this too; the fork sequential-fills the missing ordinal without
+        // touching the earlier writer-supplied value.
+        let schema = empty_schema_descr();
+        let mut assigner = super::OrdinalAssigner::new();
+
+        let rg0 = assigner
+            .ensure(0, row_group_with_ordinal(schema.clone(), Some(0)))
+            .expect("first row-group with ordinal accepted");
+        let rg1 = assigner
+            .ensure(1, row_group_with_ordinal(schema, None))
+            .expect("later row-group without ordinal accepted");
+
+        assert_eq!(rg0.ordinal(), Some(0));
+        assert_eq!(rg1.ordinal(), Some(1));
+    }
+
+    #[test]
+    fn ordinal_assigner_preserves_writer_supplied_ordinal_when_present() {
+        // If the writer already supplied an ordinal, the assigner must never
+        // overwrite it — even when the value disagrees with the row-group's
+        // position. Reader-side sequential assignment is only for the missing
+        // case; forcing values on well-formed files could silently paper over
+        // real writer bugs downstream.
+        let schema = empty_schema_descr();
+        let mut assigner = super::OrdinalAssigner::new();
+        let rg = assigner
+            .ensure(0, row_group_with_ordinal(schema, Some(7)))
+            .expect("well-formed row-group accepted");
+        assert_eq!(rg.ordinal(), Some(7));
     }
 }
