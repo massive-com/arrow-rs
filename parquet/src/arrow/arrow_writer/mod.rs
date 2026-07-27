@@ -21,9 +21,11 @@ use crate::column::chunker::ContentDefinedChunker;
 
 use bytes::Bytes;
 use std::io::{Read, Write};
+use std::iter::Peekable;
 use std::slice::Iter;
 use std::sync::{Arc, Mutex};
 use std::vec::IntoIter;
+use std::{unimplemented, unreachable};
 
 use arrow_array::cast::AsArray;
 use arrow_array::{ArrayRef, Int32Array, RecordBatch, RecordBatchWriter};
@@ -1495,11 +1497,11 @@ fn write_leaf(
                 ArrowDataType::Interval(interval_unit) => match interval_unit {
                     IntervalUnit::YearMonth => {
                         let array = column.as_primitive::<IntervalYearMonthType>();
-                        get_interval_ym_array_slice(array, indices)
+                        get_interval_ym_array_slice(array, indices.iter().copied())
                     }
                     IntervalUnit::DayTime => {
                         let array = column.as_primitive::<IntervalDayTimeType>();
-                        get_interval_dt_array_slice(array, indices)
+                        get_interval_dt_array_slice(array, indices.iter().copied())
                     }
                     _ => {
                         return Err(ParquetError::NYI(format!(
@@ -1509,7 +1511,7 @@ fn write_leaf(
                 },
                 ArrowDataType::FixedSizeBinary(_) => {
                     let array = column.as_fixed_size_binary();
-                    get_fsb_array_slice(array, indices)
+                    get_fsb_array_slice(array, indices.iter().copied())
                 }
                 ArrowDataType::Decimal32(_, _) => {
                     let array = column.as_primitive::<Decimal32Type>();
@@ -1529,7 +1531,7 @@ fn write_leaf(
                 }
                 ArrowDataType::Float16 => {
                     let array = column.as_primitive::<Float16Type>();
-                    get_float_16_array_slice(array, indices)
+                    get_float_16_array_slice(array, indices.iter().copied())
                 }
                 _ => {
                     return Err(ParquetError::NYI(
@@ -1570,7 +1572,7 @@ fn get_bool_array_slice(array: &arrow_array::BooleanArray, indices: &[usize]) ->
 /// An Arrow YearMonth interval only stores months, thus only the first 4 bytes are populated.
 fn get_interval_ym_array_slice(
     array: &arrow_array::IntervalYearMonthArray,
-    indices: &[usize],
+    indices: impl ExactSizeIterator<Item = usize>,
 ) -> Vec<FixedLenByteArray> {
     chunk_array_slice(12, indices, move |i, chunk| {
         let value = array.value(i);
@@ -1582,7 +1584,7 @@ fn get_interval_ym_array_slice(
 /// An Arrow DayTime interval only stores days and millis, thus the first 4 bytes are not populated.
 fn get_interval_dt_array_slice(
     array: &arrow_array::IntervalDayTimeArray,
-    indices: &[usize],
+    indices: impl ExactSizeIterator<Item = usize>,
 ) -> Vec<FixedLenByteArray> {
     chunk_array_slice(12, indices, move |i, chunk| {
         let value = array.value(i);
@@ -1649,7 +1651,7 @@ fn get_decimal_array_slice<T: NativeDecimalType>(
 
 fn get_float_16_array_slice(
     array: &arrow_array::Float16Array,
-    indices: &[usize],
+    indices: impl ExactSizeIterator<Item = usize>,
 ) -> Vec<FixedLenByteArray> {
     chunk_array_slice(2, indices, move |i, chunk| {
         let value = array.value(i).to_le_bytes();
@@ -1659,9 +1661,9 @@ fn get_float_16_array_slice(
 
 fn get_fsb_array_slice(
     array: &arrow_array::FixedSizeBinaryArray,
-    indices: &[usize],
+    indices: impl ExactSizeIterator<Item = usize>,
 ) -> Vec<FixedLenByteArray> {
-    chunk_array_slice(array.value_size(), indices, move |i, chunk| {
+    chunk_array_slice(array.value_length() as usize, indices, move |i, chunk| {
         let value = array.value(i);
         chunk.copy_from_slice(value);
     })
