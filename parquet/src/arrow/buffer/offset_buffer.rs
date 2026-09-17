@@ -97,18 +97,26 @@ impl<I: OffsetSizeTrait> OffsetBuffer<I> {
 
         for key in keys {
             let index = key.as_usize();
-            if index + 1 >= dict_offsets.len() {
+            let Some([start_offset, end_offset]) = dict_offsets.get(index..=(index + 1)) else {
                 return Err(general_err!(
-                    "dictionary key beyond bounds of dictionary: 0..{}",
-                    dict_offsets.len().saturating_sub(1)
+                    "dictionary key out of range: 0..{}",
+                    dict_offsets.len()
+                ));
+            };
+
+            // Dictionary values are verified when decoding dictionary page,
+            // but instead of panicking on slice fail, we might as well return an error.
+            if let Some(value_range) =
+                dict_values.get(start_offset.as_usize()..end_offset.as_usize())
+            {
+                self.values.extend_from_slice(value_range);
+            } else {
+                return Err(general_err!(
+                    "dictionary offsets out of range: 0..{}",
+                    dict_values.len()
                 ));
             }
-            let start_offset = dict_offsets[index].as_usize();
-            let end_offset = dict_offsets[index + 1].as_usize();
 
-            // Dictionary values are verified when decoding dictionary page
-            self.values
-                .extend_from_slice(&dict_values[start_offset..end_offset]);
             let index_offset = I::from_usize(self.values.len())
                 .ok_or_else(|| general_err!("index overflow decoding byte array"))?;
             self.offsets.push(index_offset);
